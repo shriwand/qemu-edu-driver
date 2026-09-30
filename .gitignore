@@ -1,0 +1,10 @@
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+Module.symvers
+modules.order
+userspace/edu_ctl
+/kernel/*.cmd
