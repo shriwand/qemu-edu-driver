@@ -45,7 +45,7 @@ cd ../linux
 vng --build 
 cd - 
 
-vng --run ../linux --disable-microvm --qemu-opts="-device edu" --user root --ssh
+vng --run ../linux --disable-microvm --qemu-opts="-device edu" --user root --ssh --rwdir .
 ```
 
 What each step does:
@@ -64,6 +64,7 @@ What each step does:
   a space-separated value is misparsed by vng's CLI.
 - `--user root` — land as root, so `insmod`/`rmmod` work without sudo.
 - `--ssh` — allows to connect using `vng --ssh-client` from another terminal. 
+- `--rwdir .` — share state of current directory between host & vm. 
 
 Inside the guest:
 
