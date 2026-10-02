@@ -32,7 +32,18 @@ MODULE_DEVICE_TABLE(pci, edu_ids);
 static int fail_step;
 module_param(fail_step, int, 0444);
 MODULE_PARM_DESC(fail_step,
-                 "Fail probe artificially: 1=after enable, 2=after BAR request");
+                 "Inject probe failure: 1=after enable, "
+                 "2=after BAR request, 3=after BAR map, "
+                 "4=after identification read");
+
+static int edu_maybe_fail(struct pci_dev *pdev, int step)
+{
+    if (fail_step != step)
+        return 0;
+
+    dev_info(&pdev->dev, "injecting failure at step %d\n", step);
+    return -EIO;
+}
 
 static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -43,23 +54,28 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     u32 ident;
     struct edu_dev *edev;
 
-    dev_info(&pdev->dev,
-            "EDU device found at %s, vendor=%04x, device=%04x\n",
-            pci_name(pdev), pdev->vendor, pdev->device);
-
-    bar_start = pci_resource_start(pdev, EDU_BAR);
-    bar_len = pci_resource_len(pdev, EDU_BAR);
-    bar_flags = pci_resource_flags(pdev, EDU_BAR);
-
-    dev_info(&pdev->dev,
-            "BAR%d: start=%pa len=%pa flags=%#lx\n",
-            EDU_BAR, &bar_start, &bar_len, bar_flags);
+    dev_info(&pdev->dev, "probing EDU at %s\n", pci_name(pdev));
 
     edev = devm_kzalloc(&pdev->dev, sizeof(*edev), GFP_KERNEL);
     if(!edev)
         return -ENOMEM;
 
     edev->pdev = pdev;
+    pci_set_drvdata(pdev, edev);
+
+    bar_start = pci_resource_start(pdev, EDU_BAR);
+    bar_len = pci_resource_len(pdev, EDU_BAR);
+    bar_flags = pci_resource_flags(pdev, EDU_BAR);
+
+    if (!(bar_flags & IORESOURCE_MEM)) {
+        dev_err(&pdev->dev, "BAR%d is not MMIO\n", EDU_BAR);
+        return -ENODEV;
+    }
+
+    if (!bar_len) {
+        dev_err(&pdev->dev, "BAR%d has zero length\n", EDU_BAR);
+        return -ENODEV;
+    }
 
     rc = pci_enable_device(pdev);
     if(rc){
@@ -67,16 +83,9 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto err_disable_device;
     }
 
-    if (fail_step == 1) {
-        rc = -EIO;
+    rc = edu_maybe_fail(pdev, 1);
+    if (rc)
         goto err_disable_device;
-    }
-
-    if (!(pci_resource_flags(pdev, EDU_BAR) & IORESOURCE_MEM)) {
-        dev_err(&pdev->dev, "BAR% is not MMIO\n", EDU_BAR);
-        rc = -ENODEV;
-        goto err_disable_device;
-    }
 
     rc = pci_request_region(pdev, EDU_BAR, EDU_DRIVER_NAME);
     if(rc){
@@ -85,10 +94,9 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto err_disable_device;
     }
 
-    if (fail_step == 2) {
-        rc = -EIO;
+    rc = edu_maybe_fail(pdev, 2);
+    if (rc)
         goto err_release_region;
-    }
 
     edev->mmio=pci_iomap(pdev, EDU_BAR, 0);
     if(!edev->mmio) {
@@ -97,13 +105,26 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto err_release_region;
     }
 
+    rc = edu_maybe_fail(pdev, 3);
+    if (rc)
+        goto err_iounmap;
+
     ident = ioread32(edev->mmio + EDU_REG_IDENT);
     dev_info(&pdev->dev,
             "EDU identification register: %#010x\n",
             ident);
 
+    rc = edu_maybe_fail(pdev, 4);
+    if (rc)
+        goto err_iounmap;
+
+    dev_info(&pdev->dev, "EDU probe completed\n");
+
 	return 0;
 
+err_iounmap:
+    pci_iounmap(pdev, edev->mmio);
+    edev->mmio = NULL;
 err_release_region:
     pci_release_region(pdev, EDU_BAR);
 err_disable_device:
@@ -118,12 +139,13 @@ static void edu_remove(struct pci_dev *pdev)
 
     dev_info(&pdev->dev, "removing EDU device\n");
 
-    if (edev && edev->mmio)
-        pci_iounmap(pdev, edev->mmio);
+    pci_iounmap(pdev, edev->mmio);
+    edev->mmio = NULL;
 
     pci_release_region(pdev, EDU_BAR);
     pci_disable_device(pdev);
 
+    dev_info(&pdev->dev, "EDU remove completed\n");
 }
 
 static struct pci_driver edu_driver = {
