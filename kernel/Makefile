@@ -3,11 +3,12 @@
 
 obj-m += edu_pci.o
 
+ccflags-y := -I$(src)/../include
+
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
-
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) modules compile_commands.json
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
