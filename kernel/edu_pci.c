@@ -68,24 +68,19 @@ MODULE_PARM_DESC(fail_step,
                  "2=after BAR request, 3=after BAR map, "
                  "4=after identification read");
 
-#if 0
 static struct dentry *edu_debugfs_root;
 
 static void edu_debugfs_init(struct edu_dev *edev)
 {
-    if (!edu_debugfs_root)
-        return;
-
     edev->debugfs_dir = debugfs_create_dir(pci_name(edev->pdev),
-                                           edu_debugfs_root);
+                                            edu_debugfs_root);
     if (IS_ERR_OR_NULL(edev->debugfs_dir)) {
         edev->debugfs_dir = NULL;
         return;
     }
 
     debugfs_create_atomic_t("irq_count", 0444,
-                            edev->debugfs_dir,
-                            &edev->irq_count);
+                            edev->debugfs_dir, &edev->irq_count);
 }
 
 static void edu_debugfs_remove(struct edu_dev *edev)
@@ -93,7 +88,6 @@ static void edu_debugfs_remove(struct edu_dev *edev)
     debugfs_remove_recursive(edev->debugfs_dir);
     edev->debugfs_dir = NULL;
 }
-#endif
 
 static void edu_disable_factorial_irq(struct edu_dev *edev)
 {
@@ -122,6 +116,8 @@ static irqreturn_t edu_irq_handler(int irq, void *data)
 
     if (!(status & EDU_IRQ_FACTORIAL))
         return IRQ_NONE;
+
+    atomic_inc(&edev->irq_count);
 
     iowrite32(status, edev->mmio + EDU_REG_IRQ_ACK);
 
@@ -329,6 +325,12 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	edu_ack_pending_irqs(edev);
 
+	edu_debugfs_init(edev);
+
+	ret = edu_maybe_fail(pdev, 6);
+	if (ret)
+	    goto err_debugfs;
+
 	edev->miscdev.minor = MISC_DYNAMIC_MINOR;
 	edev->miscdev.name = EDU_MISCDEV_NAME;
 	edev->miscdev.fops = &edu_fops;
@@ -338,7 +340,7 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		goto err_iounmap;
 
-	ret = edu_maybe_fail(pdev, 6);
+	ret = edu_maybe_fail(pdev, 7);
 	if (ret)
 	    goto err_misc_deregister;
 
@@ -349,10 +351,8 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 err_misc_deregister:
 	misc_deregister(&edev->miscdev);
-#if 0
 err_debugfs:
 	edu_debugfs_remove(edev);
-#endif
 err_free_irq:
 	free_irq(edev->irq, edev);
 err_iounmap:
@@ -373,6 +373,7 @@ static void edu_remove(struct pci_dev *pdev)
     dev_info(&pdev->dev, "removing EDU at %s\n", pci_name(pdev));
 
     misc_deregister(&edev->miscdev);
+    edu_debugfs_remove(edev);
 
     edu_disable_factorial_irq(edev);
     edu_ack_pending_irqs(edev);
@@ -388,14 +389,24 @@ static void edu_remove(struct pci_dev *pdev)
     dev_info(&pdev->dev, "EDU remove completed\n");
 }
 
-#if 0
+static struct pci_driver edu_driver = {
+	.name = EDU_NAME,
+	.id_table = edu_ids,
+	.probe = edu_probe,
+	.remove = edu_remove,
+};
+
 static int __init edu_init(void)
 {
     int ret;
 
     edu_debugfs_root = debugfs_create_dir(EDU_NAME, NULL);
+    if (IS_ERR_OR_NULL(edu_debugfs_root)) {
+        pr_info("edu: debugfs unavailable, continuing without debug counters\n");
+        edu_debugfs_root = NULL;
+    }
 
-    ret = pci_register_driver(&edu_pci_driver);
+    ret = pci_register_driver(&edu_driver);
     if (ret) {
         debugfs_remove_recursive(edu_debugfs_root);
         edu_debugfs_root = NULL;
@@ -407,21 +418,13 @@ static int __init edu_init(void)
 
 static void __exit edu_exit(void)
 {
-    pci_unregister_driver(&edu_pci_driver);
+    pci_unregister_driver(&edu_driver);
     debugfs_remove_recursive(edu_debugfs_root);
     edu_debugfs_root = NULL;
 }
-#endif
 
-static struct pci_driver edu_driver = {
-	.name = "edu",
-	.id_table = edu_ids,
-	.probe = edu_probe,
-	.remove = edu_remove,
-};
-
-module_pci_driver(edu_driver);
-
+module_init(edu_init);
+module_exit(edu_exit);
 
 MODULE_AUTHOR("Ivan Sharavuev<shriwand@gmail.com>");
 MODULE_DESCRIPTION("QEMU edu pic driver");
