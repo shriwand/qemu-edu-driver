@@ -9,10 +9,13 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/fs.h>
-#include <linux/iopoll.h>
 #include <linux/miscdevice.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
+#include <linux/completion.h>
+#include <linux/interrupt.h>
+#include <linux/jiffies.h>
+#include <linux/debugfs.h>
 
 #include "uapi/edu_uapi.h"
 
@@ -21,21 +24,36 @@
 
 #define EDU_BAR 0
 #define EDU_REG_IDENT 0
-#define EDU_DRIVER_NAME "edu_pci"
-#define EDU_MISCDEV_NAME "edu0"
+#define EDU_NAME "edu"
+#define EDU_DRIVER_NAME EDU_NAME "_PCI"
+#define EDU_MISCDEV_NAME EDU_NAME "0"
 
 #define EDU_REG_FACTORIAL          0x08
 #define EDU_REG_STATUS             0x20
 
-#define EDU_STATUS_COMPUTING       0x01
 #define EDU_STATUS_INT_ENABLE      0x80
+
+#define EDU_REG_IRQ_STATUS         0x24
+#define EDU_REG_IRQ_RAISE          0x60
+#define EDU_REG_IRQ_ACK            0x64
+
+#define EDU_IRQ_FACTORIAL          0x01
+#define EDU_FACTORIAL_TIMEOUT_MS   1000
 
 struct edu_dev {
 	struct pci_dev *pdev;
 	void __iomem *mmio;
-	struct miscdevice miscdev;
+
 	struct mutex op_lock;
+	struct completion factorial_done;
+	atomic_t irq_count;
+
+	int irq;
+	struct miscdevice miscdev;
+
+	struct dentry *debugfs_dir;
 };
+
 
 static const struct pci_device_id edu_ids[] = {
 	{ PCI_DEVICE(EDU_VENDOR_ID, EDU_DEVICE_ID) },
@@ -50,6 +68,98 @@ MODULE_PARM_DESC(fail_step,
                  "2=after BAR request, 3=after BAR map, "
                  "4=after identification read");
 
+#if 0
+static struct dentry *edu_debugfs_root;
+
+static void edu_debugfs_init(struct edu_dev *edev)
+{
+    if (!edu_debugfs_root)
+        return;
+
+    edev->debugfs_dir = debugfs_create_dir(pci_name(edev->pdev),
+                                           edu_debugfs_root);
+    if (IS_ERR_OR_NULL(edev->debugfs_dir)) {
+        edev->debugfs_dir = NULL;
+        return;
+    }
+
+    debugfs_create_atomic_t("irq_count", 0444,
+                            edev->debugfs_dir,
+                            &edev->irq_count);
+}
+
+static void edu_debugfs_remove(struct edu_dev *edev)
+{
+    debugfs_remove_recursive(edev->debugfs_dir);
+    edev->debugfs_dir = NULL;
+}
+#endif
+
+static void edu_disable_factorial_irq(struct edu_dev *edev)
+{
+    u32 status;
+
+    status = ioread32(edev->mmio + EDU_REG_STATUS);
+    iowrite32(status & ~EDU_STATUS_INT_ENABLE,
+              edev->mmio + EDU_REG_STATUS);
+}
+
+static void edu_ack_pending_irqs(struct edu_dev *edev)
+{
+    u32 status;
+
+    status = ioread32(edev->mmio + EDU_REG_IRQ_STATUS);
+    if (status)
+        iowrite32(status, edev->mmio + EDU_REG_IRQ_ACK);
+}
+
+static irqreturn_t edu_irq_handler(int irq, void *data)
+{
+    struct edu_dev *edev = data;
+    u32 status;
+
+    status = ioread32(edev->mmio + EDU_REG_IRQ_STATUS);
+
+    if (!(status & EDU_IRQ_FACTORIAL))
+        return IRQ_NONE;
+
+    iowrite32(status, edev->mmio + EDU_REG_IRQ_ACK);
+
+    complete(&edev->factorial_done);
+
+    return IRQ_HANDLED;
+}
+
+
+static int edu_run_factorial(struct edu_dev *edev,
+	struct edu_factorial_req *req)
+{
+	u32 status;
+	unsigned long timeout;
+
+	reinit_completion(&edev->factorial_done);
+
+	status = ioread32(edev->mmio + EDU_REG_STATUS);
+	iowrite32(status | EDU_STATUS_INT_ENABLE,
+		edev->mmio + EDU_REG_STATUS);
+
+	iowrite32(req->input, edev->mmio + EDU_REG_FACTORIAL);
+
+	timeout = wait_for_completion_timeout(
+		&edev->factorial_done,
+		msecs_to_jiffies(EDU_FACTORIAL_TIMEOUT_MS));
+
+	edu_disable_factorial_irq(edev);
+
+	if (!timeout) {
+		dev_err(&edev->pdev->dev, "factorial operation timed out\n");
+		return -ETIMEDOUT;
+	}
+
+	req->result = ioread32(edev->mmio + EDU_REG_FACTORIAL);
+	return 0;
+}
+
 static int edu_open(struct inode *unused_inode, struct file *file)
 {
     struct miscdevice *miscdev = file->private_data;
@@ -59,29 +169,6 @@ static int edu_open(struct inode *unused_inode, struct file *file)
     return 0;
 }
 
-static int edu_run_factorial(struct edu_dev *edev,
-	struct edu_factorial_req *req)
-{
-	u32 status;
-	int ret;
-
-	iowrite32(req->input, edev->mmio + EDU_REG_FACTORIAL);
-	ret = readl_poll_timeout(edev->mmio + EDU_REG_STATUS,
-		status,
-		!(status & EDU_STATUS_COMPUTING),
-		EDU_FACTORIAL_POLL_US,
-		EDU_FACTORIAL_TIMEOUT_US);
-
-	if (ret) {
-	    dev_err(&edev->pdev->dev,
-		    "factorial operation timed out, status=%#x\n",
-		    status);
-	    return ret;
-	}
-
-	req->result = ioread32(edev->mmio + EDU_REG_FACTORIAL);
-	return 0;
-}
 
 static long edu_ioctl(struct file *file,
                       unsigned int cmd,
@@ -159,6 +246,8 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	pci_set_drvdata(pdev, edev);
 
 	mutex_init(&edev->op_lock);
+	init_completion(&edev->factorial_done);
+	atomic_set(&edev->irq_count, 0);
 
 	bar_start = pci_resource_start(pdev, EDU_BAR);
 	bar_len = pci_resource_len(pdev, EDU_BAR);
@@ -215,6 +304,31 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		goto err_iounmap;
 
+	edev->irq = pdev->irq;
+	if (edev->irq <= 0) {
+		dev_err(&pdev->dev, "no legacy IRQ assigned\n");
+		ret = -ENXIO;
+		goto err_iounmap;
+	}
+
+	ret = request_irq(edev->irq,
+		edu_irq_handler,
+		IRQF_SHARED,
+		EDU_DRIVER_NAME,
+		edev);
+
+	if (ret) {
+		dev_err(&pdev->dev, "request_irq(%d) failed: %d\n",
+			edev->irq, ret);
+		goto err_iounmap;
+	}
+
+	ret = edu_maybe_fail(pdev, 5);
+	if (ret)
+	    goto err_free_irq;
+
+	edu_ack_pending_irqs(edev);
+
 	edev->miscdev.minor = MISC_DYNAMIC_MINOR;
 	edev->miscdev.name = EDU_MISCDEV_NAME;
 	edev->miscdev.fops = &edu_fops;
@@ -224,7 +338,7 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		goto err_iounmap;
 
-	ret = edu_maybe_fail(pdev, 5);
+	ret = edu_maybe_fail(pdev, 6);
 	if (ret)
 	    goto err_misc_deregister;
 
@@ -235,6 +349,12 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 err_misc_deregister:
 	misc_deregister(&edev->miscdev);
+#if 0
+err_debugfs:
+	edu_debugfs_remove(edev);
+#endif
+err_free_irq:
+	free_irq(edev->irq, edev);
 err_iounmap:
 	pci_iounmap(pdev, edev->mmio);
 	edev->mmio = NULL;
@@ -254,6 +374,11 @@ static void edu_remove(struct pci_dev *pdev)
 
     misc_deregister(&edev->miscdev);
 
+    edu_disable_factorial_irq(edev);
+    edu_ack_pending_irqs(edev);
+
+    free_irq(edev->irq, edev);
+
     pci_iounmap(pdev, edev->mmio);
     edev->mmio = NULL;
 
@@ -262,6 +387,31 @@ static void edu_remove(struct pci_dev *pdev)
 
     dev_info(&pdev->dev, "EDU remove completed\n");
 }
+
+#if 0
+static int __init edu_init(void)
+{
+    int ret;
+
+    edu_debugfs_root = debugfs_create_dir(EDU_NAME, NULL);
+
+    ret = pci_register_driver(&edu_pci_driver);
+    if (ret) {
+        debugfs_remove_recursive(edu_debugfs_root);
+        edu_debugfs_root = NULL;
+        return ret;
+    }
+
+    return 0;
+}
+
+static void __exit edu_exit(void)
+{
+    pci_unregister_driver(&edu_pci_driver);
+    debugfs_remove_recursive(edu_debugfs_root);
+    edu_debugfs_root = NULL;
+}
+#endif
 
 static struct pci_driver edu_driver = {
 	.name = "edu",
