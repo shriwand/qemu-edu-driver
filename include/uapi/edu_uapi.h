@@ -17,7 +17,5 @@ struct edu_factorial_req {
 	_IOWR(EDU_IOCTL_MAGIC,0x1,struct edu_factorial_req)
 
 #define EDU_FACTORIAL_MAX_INPUT    12
-#define EDU_FACTORIAL_TIMEOUT_US   1000000
-#define EDU_FACTORIAL_POLL_US      10
 
 #endif /* _EDU_UAPI_H */

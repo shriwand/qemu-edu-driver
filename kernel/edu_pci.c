@@ -25,7 +25,7 @@
 #define EDU_BAR 0
 #define EDU_REG_IDENT 0
 #define EDU_NAME "edu"
-#define EDU_DRIVER_NAME EDU_NAME "_PCI"
+#define EDU_DRIVER_NAME EDU_NAME "_pci"
 #define EDU_MISCDEV_NAME EDU_NAME "0"
 
 #define EDU_REG_FACTORIAL          0x08
@@ -226,7 +226,6 @@ static int edu_maybe_fail(struct pci_dev *pdev, int step)
 static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	int ret;
-	resource_size_t bar_start;
 	resource_size_t bar_len;
 	unsigned long bar_flags;
 	u32 ident;
@@ -245,7 +244,6 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	init_completion(&edev->factorial_done);
 	atomic_set(&edev->irq_count, 0);
 
-	bar_start = pci_resource_start(pdev, EDU_BAR);
 	bar_len = pci_resource_len(pdev, EDU_BAR);
 	bar_flags = pci_resource_flags(pdev, EDU_BAR);
 
@@ -338,7 +336,7 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	ret = misc_register(&edev->miscdev);
 	if (ret)
-		goto err_iounmap;
+		goto err_debugfs;
 
 	ret = edu_maybe_fail(pdev, 7);
 	if (ret)
