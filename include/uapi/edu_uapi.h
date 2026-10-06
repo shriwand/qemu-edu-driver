@@ -1,5 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
-/* edu_uapi.h — ABI SKELETON. Leave empty until LAB5. */
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef _EDU_UAPI_H
 #define _EDU_UAPI_H
 #include <linux/ioctl.h>
