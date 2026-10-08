@@ -8,3 +8,4 @@ Module.symvers
 modules.order
 userspace/edu_ctl
 /kernel/*.cmd
+/tests/edu_lifetime
