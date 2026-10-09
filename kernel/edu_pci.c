@@ -63,10 +63,13 @@ struct edu_dev {
 	struct miscdevice miscdev;
 	struct dentry *debugfs_dir;
 
+	/* ownship flags for generic cleanup */
 	bool pci_enabled;
 	bool bar_requested;
 	bool irq_requested;
 	bool misc_registered;
+	bool msi_enabled;
+	bool irq_vectors_allocated;
 
 	char bdf[32];
 };
@@ -90,8 +93,10 @@ MODULE_DEVICE_TABLE(pci, edu_ids);
 static int fail_step;
 module_param(fail_step, int, 0444);
 MODULE_PARM_DESC(fail_step,
-    "Probe failure: 1=enable, 2=BAR, 3=map, 4=prepare, "
-    "5=IRQ, 6=debugfs, 7=misc publication");
+    "Probe failure: "
+    "1=enable, 2=BAR, 3=map, 4=prepare, "
+    "5=IRQ, 6=debugfs, 7=misc publication, "
+    "8=IRQ vector allocation, 9=before request_irq");
 
 static unsigned int test_hold_ms;
 module_param(test_hold_ms, uint, 0444);
@@ -247,6 +252,9 @@ static irqreturn_t edu_irq_handler(int irq, void *data)
 	 * the factorial engine faulted.
 	 */
 	if (status & ~EDU_IRQ_FACTORIAL) {
+		pr_warn_ratelimited(
+			"edu: %s unsupported IRQ causes=%#x\n",
+			edev->bdf, status);
 		edev->faulted = true;
 		notify = edev->op_active;
 	}
@@ -284,12 +292,18 @@ static int edu_run_factorial_locked(struct edu_dev *edev, struct edu_factorial_r
 	}
 
 	if (edev->faulted) {
+		pr_warn_ratelimited(
+			"edu: %s factorial rejected: engine already faulted\n",
+			edev->bdf);
 		ret = -EIO;
 		goto out_lock;
 	}
 
 	status = ioread32(edev->mmio + EDU_REG_STATUS);
 	if (status & EDU_STATUS_BUSY) {
+		pr_warn_ratelimited(
+			"edu: %s factorial rejected: busy before start, status=%#x\n",
+			edev->bdf, status);
 		edev->faulted = true;
 		ret = -EIO;
 		goto out_lock;
@@ -348,6 +362,11 @@ static int edu_run_factorial_locked(struct edu_dev *edev, struct edu_factorial_r
 	}
 
 	if (edev->faulted) {
+		pr_warn_ratelimited(
+			"edu: %s factorial failed: fault latched while waiting\n",
+			edev->bdf);    pr_warn_ratelimited(
+				"edu: %s factorial failed: fault latched while waiting\n",
+				edev->bdf);
 		edu_disable_factorial_irq_locked(edev);
 		edu_ack_all_pending_locked(edev);
 		ret = -EIO;
@@ -356,6 +375,9 @@ static int edu_run_factorial_locked(struct edu_dev *edev, struct edu_factorial_r
 
 	status = ioread32(edev->mmio + EDU_REG_STATUS);
 	if (status & EDU_STATUS_BUSY) {
+		pr_warn_ratelimited(
+			"edu: %s factorial failed: busy after completion, status=%#x\n",
+			edev->bdf, status);
 		edev->faulted = true;
 		edu_disable_factorial_irq_locked(edev);
 		edu_ack_all_pending_locked(edev);
@@ -509,6 +531,82 @@ static int edu_maybe_fail(struct pci_dev *pdev, int step)
 	return -EIO;
 }
 
+static int edu_setup_irqs(struct edu_dev *edev)
+{
+	struct pci_dev *pdev = edev->pdev;
+	unsigned long flags;
+	int ret = 0;
+
+	ret = pci_alloc_irq_vectors(pdev, 1, 1,
+		PCI_IRQ_MSI | PCI_IRQ_INTX);
+	if (ret < 0) {
+		dev_err(&pdev->dev,"failed to allocate irq vector: %d\n", ret);
+		return ret;
+	}
+
+	edev->irq_vectors_allocated = true;
+
+	ret = edu_maybe_fail(pdev, 8);
+	if (ret)
+		return ret;
+
+	ret = pci_irq_vector(pdev, 0);
+	if (ret < 0) {
+		dev_err(&pdev->dev,
+			"failed to get IRQ vector 0: %d\n", ret);
+		return ret;
+	}
+
+	edev->irq = ret;
+
+	/*
+	 * MSI-X is not requested by this driver.
+	 * Therefore true means MSI in this setup.
+	 */
+	edev->msi_enabled = pci_dev_msi_enabled(pdev);
+
+	flags = edev->msi_enabled ? 0 : IRQF_SHARED;
+
+	ret = edu_maybe_fail(pdev, 9);
+	if (ret)
+		return ret;
+
+	ret = request_irq(edev->irq, edu_irq_handler,
+		flags, EDU_DRIVER_NAME, edev);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"request_irq(%d, mode=%s) failed: %d\n",
+			edev->irq,
+			edev->msi_enabled ? "MSI" : "INTx",
+			ret);
+		return ret;
+	}
+
+	edev->irq_requested = true;
+
+	dev_info(&pdev->dev,
+		"IRQ setup: mode=%s, irq=%d, vectors=1\n",
+		edev->msi_enabled ? "MSI" : "INTx",
+		edev->irq);
+
+	return ret;
+}
+
+static void edu_teardown_irqs(struct edu_dev *edev)
+{
+	if (edev->irq_requested) {
+		free_irq(edev->irq, edev);
+		edev->irq_requested = false;
+	}
+	if (edev->irq_vectors_allocated) {
+		pci_free_irq_vectors(edev->pdev);
+		edev->irq_vectors_allocated = false;
+	}
+
+	edev->irq = -1;
+	edev->msi_enabled = false;
+}
+
 static void edu_disconnect_and_cleanup(struct edu_dev *edev)
 {
 	struct pci_dev *pdev = edev->pdev;
@@ -550,10 +648,7 @@ static void edu_disconnect_and_cleanup(struct edu_dev *edev)
 	 * Never hold state_lock here: an in-flight handler may
 	 * need it before free_irq() can finish.
 	 */
-	if (edev->irq_requested) {
-		free_irq(edev->irq, edev);
-		edev->irq_requested = false;
-	}
+	edu_teardown_irqs(edev);
 
 	if (edev->mmio) {
 		pci_iounmap(pdev, edev->mmio);
@@ -566,6 +661,7 @@ static void edu_disconnect_and_cleanup(struct edu_dev *edev)
 	}
 
 	if (edev->pci_enabled) {
+		pci_clear_master(pdev);
 		pci_disable_device(pdev);
 		edev->pci_enabled = false;
 	}
@@ -611,6 +707,9 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	edev->bar_requested   = false;
 	edev->irq_requested   = false;
 	edev->misc_registered = false;
+	edev->msi_enabled           = false;
+	edev->irq_vectors_allocated = false;
+	edev->irq = -1;
 	pci_set_drvdata(pdev, edev);
 
 	bar_len = pci_resource_len(pdev, EDU_BAR);
@@ -688,22 +787,17 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		goto err_cleanup;
 
-	edev->irq = pdev->irq;
-	if (edev->irq <= 0) {
-		dev_err(&pdev->dev, "no legacy IRQ assigned\n");
-		ret = -ENXIO;
-		goto err_cleanup;
-	}
+	/*
+	* MMIO is mapped, stale device interrupt state is cleared,
+	* and the factorial engine has been checked for busy.
+	*
+	* MSI delivery is a device-initiated memory write.
+	*/
+	pci_set_master(pdev);
 
-	ret = request_irq(edev->irq, edu_irq_handler, IRQF_SHARED,
-			  EDU_DRIVER_NAME, edev);
-
-	if (ret) {
-		dev_err(&pdev->dev, "request_irq(%d) failed: %d\n", edev->irq,
-			ret);
+	ret = edu_setup_irqs(edev);
+	if (ret)
 		goto err_cleanup;
-	}
-	edev->irq_requested = true;
 
 	ret = edu_maybe_fail(pdev, 5);
 	if (ret)
@@ -764,7 +858,7 @@ static int __init edu_init(void)
 {
     int ret;
 
-    if (fail_step < 0 || fail_step > 7 ||
+    if (fail_step < 0 || fail_step > 9 ||
         test_hold_ms > 10000 ||
         test_publish_pause_ms > 10000)
         return -EINVAL;
