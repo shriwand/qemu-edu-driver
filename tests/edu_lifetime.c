@@ -54,14 +54,14 @@ static int run_ioctl(int fd, enum test_operation op,
 {
     int ret;
 
-    if (op == TEST_DMA) {
+    if (op == TEST_DMA || op == TEST_STREAM) {
         struct edu_dma_selftest_req req = { 0 };
 
         req.length = value;
 
 	unsigned long command = op == TEST_STREAM
-	    ? EDU_IOCTL_DMA_STREAM_SELFTEST
-	    : EDU_IOCTL_DMA_SELFTEST;
+	    ? EDU_IOCTL_DMA_SELFTEST
+	    : EDU_IOCTL_DMA_STREAM_SELFTEST;
 
         ret = ioctl(fd, command, &req);
         if (ret == -1) {
@@ -73,7 +73,7 @@ static int run_ioctl(int fd, enum test_operation op,
             return saved;
         }
 
-        printf("fd=%d op=dma length=%u PASS\n", fd, value);
+        printf("fd=%d op=%s length=%u PASS\n", fd, operation_name(op), value);
     } else {
         struct edu_factorial_req req = { 0 };
 
@@ -179,7 +179,7 @@ int main(int argc, char **argv)
     if (argc == 3) {
         if (!strcmp(argv[2], "dma"))
             op = TEST_DMA;
-        if (!strcmp(argv[2], "stream"))
+        else if (!strcmp(argv[2], "stream"))
 	    op = TEST_STREAM;
         else if (strcmp(argv[2], "factorial")) {
             usage(argv[0]);

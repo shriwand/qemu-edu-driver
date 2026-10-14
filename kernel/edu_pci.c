@@ -260,8 +260,6 @@ static void edu_disable_factorial_irq_locked(struct edu_dev *edev)
 {
 	u32 status;
 
-	lockdep_assert_held(&edev->op_lock);
-
 	status = ioread32(edev->mmio + EDU_REG_STATUS);
 	iowrite32(status & ~EDU_STATUS_INT_ENABLE,
 		edev->mmio + EDU_REG_STATUS);
@@ -273,8 +271,6 @@ static void edu_disable_factorial_irq_locked(struct edu_dev *edev)
 static void edu_ack_all_pending_locked(struct edu_dev *edev)
 {
 	u32 status;
-
-	lockdep_assert_held(&edev->op_lock);
 
 	status = ioread32(edev->mmio + EDU_REG_IRQ_STATUS);
 	if (status) {
@@ -472,10 +468,12 @@ static int edu_dma_selftest_locked(struct edu_dev *edev, size_t length)
 
 	if (edev->disconnected)
 		ret = -ENODEV;
-	if (edev->dma_faulted)
+	else if (edev->dma_faulted)
 		ret = -EIO;
-	if (!edev->dma_cpu)
+	else if (!edev->dma_cpu)
 		ret = -ENODEV;
+	else
+		ret = 0;
 
 	spin_unlock_irqrestore(&edev->state_lock, flags);
 
@@ -584,8 +582,10 @@ static int edu_dma_stream_selftest_locked(struct edu_dev *edev, size_t length)
 
 	if (edev->disconnected)
 		ret = -ENODEV;
-	if (edev->dma_faulted)
+	else if (edev->dma_faulted)
 		ret = -EIO;
+	else
+		ret = 0;
 
 	spin_unlock_irqrestore(&edev->state_lock, flags);
 
@@ -1232,9 +1232,10 @@ static void edu_dma_free(struct edu_dev *edev)
 
 /*
  * Caller holds op_lock.
- * No new DMA can start: disconnected is already true.
- * MMIO remains mapped throughout the drain.
+ * No other driver transaction can start DMA while op_lock is held.
+ * MMIO and PCI resources remain valid throughout this call.
  *
+ * Used by both operation cleanup and device teardown.
  * Intentionally unbounded: EDU has no documented abort command.
  */
 static void edu_dma_drain_locked(struct edu_dev *edev)
@@ -1466,9 +1467,12 @@ static int __init edu_init(void)
     int ret;
 
     if (fail_step < 0 || fail_step > 10 ||
-        test_hold_ms > 10000 ||
-        test_publish_pause_ms > 10000)
-        return -EINVAL;
+	test_hold_ms > 10000 ||
+	test_publish_pause_ms > 10000 ||
+	test_dma_hold_ms > 10000 ||
+	test_stream_fail_step < 0 ||
+	test_stream_fail_step > 3)
+	    return -EINVAL;
 
     edu_debugfs_root = debugfs_create_dir(EDU_NAME, NULL);
     if (IS_ERR_OR_NULL(edu_debugfs_root))

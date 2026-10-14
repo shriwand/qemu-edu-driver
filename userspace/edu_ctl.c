@@ -87,8 +87,8 @@ int main(int argc, char **argv)
 
         req.length = (__u32)value;
 	unsigned long command = !strcmp(argv[1], "dma-stream")
-	    ? EDU_IOCTL_DMA_STREAM_SELFTEST
-	    : EDU_IOCTL_DMA_SELFTEST;
+	    ? EDU_IOCTL_DMA_SELFTEST
+	    : EDU_IOCTL_DMA_STREAM_SELFTEST;
         ret = ioctl(fd, command, &req);
         saved_errno = errno;
 
