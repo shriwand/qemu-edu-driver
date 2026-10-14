@@ -9,14 +9,17 @@
 #include <linux/completion.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
+#include <linux/lockdep.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 
 #include "uapi/edu_uapi.h"
@@ -25,11 +28,11 @@
 #define EDU_DEVICE_ID 0x11e8
 
 #define EDU_BAR 0
-#define EDU_BAR_MIN_SIZE (EDU_REG_IRQ_ACK + sizeof(u32))
 #define EDU_REG_IDENT 0x0
 #define EDU_NAME "edu"
 #define EDU_DRIVER_NAME EDU_NAME "_pci"
 #define EDU_MISCDEV_NAME EDU_NAME "0"
+#define EDU_IRQ_KNOWN (EDU_IRQ_FACTORIAL | EDU_IRQ_DMA)
 
 #define EDU_REG_FACTORIAL         0x08
 #define EDU_REG_STATUS            0x20
@@ -41,6 +44,27 @@
 #define EDU_IRQ_FACTORIAL         0x01
 
 #define EDU_FACTORIAL_TIMEOUT_MS  1000
+
+#define EDU_REG_DMA_SRC       0x80
+#define EDU_REG_DMA_DST       0x88
+#define EDU_REG_DMA_COUNT     0x90
+#define EDU_REG_DMA_CMD       0x98
+
+#define EDU_DMA_START         BIT_ULL(0)
+#define EDU_DMA_FROM_DEVICE   BIT_ULL(1)
+#define EDU_DMA_IRQ_ENABLE    BIT_ULL(2)
+
+#define EDU_IRQ_DMA           BIT(8)
+
+#define EDU_DMA_INTERNAL_BASE 0x40000ULL
+#define EDU_DMA_BUFFER_SIZE   4096U
+#define EDU_DMA_ALLOC_SIZE    (2U * EDU_DMA_BUFFER_SIZE)
+
+#define EDU_DMA_TIMEOUT_MS    1000U
+#define EDU_DMA_RX_GUARD      0xa5
+
+#define EDU_BAR_MIN_SIZE \
+    (EDU_REG_DMA_CMD + sizeof(u64))
 
 struct edu_dev {
 	struct kref refcount;
@@ -59,6 +83,14 @@ struct edu_dev {
 	struct completion factorial_done;
 	wait_queue_head_t test_wq;
 	atomic_t irq_count;
+
+	void *dma_cpu;
+	dma_addr_t dma_handle;
+	size_t dma_size;
+
+	struct completion dma_done;
+	bool dma_active;
+	bool dma_faulted;
 
 	struct miscdevice miscdev;
 	struct dentry *debugfs_dir;
@@ -93,10 +125,11 @@ MODULE_DEVICE_TABLE(pci, edu_ids);
 static int fail_step;
 module_param(fail_step, int, 0444);
 MODULE_PARM_DESC(fail_step,
-    "Probe failure: "
-    "1=enable, 2=BAR, 3=map, 4=prepare, "
-    "5=IRQ, 6=debugfs, 7=misc publication, "
-    "8=IRQ vector allocation, 9=before request_irq");
+	"Probe failure: "
+	"1=enable, 2=BAR, 3=map, 4=prepare, "
+	"5=IRQ, 6=debugfs, 7=misc publication, "
+	"8=IRQ vector allocation, 9=before request_irq, "
+	"10=after coherent DMA allocation");
 
 static unsigned int test_hold_ms;
 module_param(test_hold_ms, uint, 0444);
@@ -112,6 +145,16 @@ static unsigned int test_publish_pause_ms;
 module_param(test_publish_pause_ms, uint, 0444);
 MODULE_PARM_DESC(test_publish_pause_ms,
     "Test-only pause after misc publication, max 10000 ms");
+
+static bool test_force_dma_timeout;
+module_param(test_force_dma_timeout, bool, 0444);
+MODULE_PARM_DESC(test_force_dma_timeout,
+    "Test-only: ACK DMA IRQ but suppress DMA completion");
+
+static unsigned int test_dma_hold_ms;
+module_param(test_dma_hold_ms, uint, 0444);
+MODULE_PARM_DESC(test_dma_hold_ms,
+    "Test-only cancellable hold after DMA start, max 10000 ms");
 
 static struct dentry *edu_debugfs_root;
 
@@ -211,6 +254,8 @@ static void edu_disable_factorial_irq_locked(struct edu_dev *edev)
 {
 	u32 status;
 
+	lockdep_assert_held(&edev->op_lock);
+
 	status = ioread32(edev->mmio + EDU_REG_STATUS);
 	iowrite32(status & ~EDU_STATUS_INT_ENABLE,
 		edev->mmio + EDU_REG_STATUS);
@@ -222,6 +267,8 @@ static void edu_disable_factorial_irq_locked(struct edu_dev *edev)
 static void edu_ack_all_pending_locked(struct edu_dev *edev)
 {
 	u32 status;
+
+	lockdep_assert_held(&edev->op_lock);
 
 	status = ioread32(edev->mmio + EDU_REG_IRQ_STATUS);
 	if (status) {
@@ -235,7 +282,8 @@ static irqreturn_t edu_irq_handler(int irq, void *data)
 	struct edu_dev *edev = data;
 	unsigned long flags;
 	u32 status;
-	bool notify = false;
+	bool notify_factorial = false;
+	bool notify_dma = false;
 
 	spin_lock_irqsave(&edev->state_lock, flags);
 
@@ -247,33 +295,261 @@ static irqreturn_t edu_irq_handler(int irq, void *data)
 	}
 
 	/*
-	 * No DMA is started by this driver.
-	 * Unsupported device causes are acknowledged and make
-	 * the factorial engine faulted.
+	 * irq_count now counts handled device IRQ snapshots,
+	 * not factorial completions alone.
 	 */
-	if (status & ~EDU_IRQ_FACTORIAL) {
+	atomic_inc(&edev->irq_count);
+
+	if (status & ~EDU_IRQ_KNOWN) {
 		pr_warn_ratelimited(
 			"edu: %s unsupported IRQ causes=%#x\n",
 			edev->bdf, status);
 		edev->faulted = true;
-		notify = edev->op_active;
+		edev->dma_faulted = true;
+		notify_factorial = edev->op_active;
+		notify_dma = edev->dma_active;
 	}
 
 	if (status & EDU_IRQ_FACTORIAL) {
-		atomic_inc(&edev->irq_count);
-
 		if (edev->op_active && !edev->suppress_completion)
-			notify = true;
+			notify_factorial = true;
+	}
+
+	if (status & EDU_IRQ_DMA && !test_force_dma_timeout) {
+		if (edev->dma_active)
+			notify_dma = true;
 	}
 
 	iowrite32(status, edev->mmio + EDU_REG_IRQ_ACK);
 
-	if (notify)
+	if (notify_factorial)
 		complete(&edev->factorial_done);
+
+	if(notify_dma)
+		complete(&edev->dma_done);
 
 	spin_unlock_irqrestore(&edev->state_lock, flags);
 
 	return IRQ_HANDLED;
+}
+
+static int edu_dma_transfer_locked(struct edu_dev *edev, u64 source,
+	u64 destination, size_t length, bool from_device)
+{
+	unsigned long flags;
+	unsigned long completed;
+	u64 command;
+	int ret;
+
+	lockdep_assert_held(&edev->op_lock);
+
+	if (!length || length > EDU_DMA_BUFFER_SIZE)
+		return -EINVAL;
+
+	spin_lock_irqsave(&edev->state_lock, flags);
+
+	if (edev->disconnected) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
+	if (edev->dma_faulted) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+
+	command = readq(edev->mmio + EDU_REG_DMA_CMD);
+	if (command & EDU_DMA_START) {
+		edev->dma_faulted = true;
+		ret = -EIO;
+		goto out_unlock;
+	}
+
+	/*
+	 * Clear only the DMA cause. Factorial cause belongs
+	 * to the existing factorial protocol.
+	 */
+	iowrite32(EDU_IRQ_DMA,
+		edev->mmio + EDU_REG_IRQ_ACK);
+
+	reinit_completion(&edev->dma_done);
+	edev->dma_active = true;
+
+	/*
+	 * Publish prior coherent-buffer stores before starting
+	 * the transaction. Ordered MMIO accessors are used below.
+	 */
+	dma_wmb();
+
+	writeq(source, edev->mmio + EDU_REG_DMA_SRC);
+	writeq(destination, edev->mmio + EDU_REG_DMA_DST);
+	writeq(length, edev->mmio + EDU_REG_DMA_COUNT);
+
+	command = EDU_DMA_START | EDU_DMA_IRQ_ENABLE;
+	if (from_device)
+		command |= EDU_DMA_FROM_DEVICE;
+
+	writeq(command, edev->mmio + EDU_REG_DMA_CMD);
+	readq(edev->mmio + EDU_REG_DMA_CMD);
+
+	spin_unlock_irqrestore(&edev->state_lock, flags);
+
+	if (test_dma_hold_ms) {
+		pr_info("edu: %s DMA test point: transfer started, dir=%s\n",
+			edev->bdf,
+			from_device ? "EDU->RAM" : "RAM->EDU");
+
+		wait_event_timeout(
+			edev->test_wq,
+			READ_ONCE(edev->disconnected),
+			msecs_to_jiffies(test_dma_hold_ms));
+	}
+
+	completed = wait_for_completion_timeout(
+		&edev->dma_done,
+		msecs_to_jiffies(EDU_DMA_TIMEOUT_MS));
+
+	spin_lock_irqsave(&edev->state_lock, flags);
+
+	/*
+	 * Before any post-wait MMIO access.
+	 */
+	if (edev->disconnected) {
+		ret = -ENODEV;
+		goto out_finish;
+	}
+
+	if (!completed) {
+		edev->dma_faulted = true;
+		ret = -ETIMEDOUT;
+		goto out_finish;
+	}
+
+	if (edev->dma_faulted) {
+		ret = -EIO;
+		goto out_finish;
+	}
+
+	command = readq(edev->mmio + EDU_REG_DMA_CMD);
+	if (command & EDU_DMA_START) {
+		edev->dma_faulted = true;
+		ret = -EIO;
+		goto out_finish;
+	}
+
+	ret = 0;
+
+out_finish:
+	edev->dma_active = false;
+
+out_unlock:
+	spin_unlock_irqrestore(&edev->state_lock, flags);
+	return ret;
+}
+
+static int edu_dma_selftest_locked(struct edu_dev *edev, size_t length)
+{
+	unsigned long flags;
+	dma_addr_t tx_dma;
+	dma_addr_t rx_dma;
+	u8 *tx;
+	u8 *rx;
+	size_t i;
+	int ret = 0;
+
+	lockdep_assert_held(&edev->op_lock);
+
+	if (!length || length > EDU_DMA_BUFFER_SIZE)
+		return -EINVAL;
+
+	spin_lock_irqsave(&edev->state_lock, flags);
+
+	if (edev->disconnected)
+		ret = -ENODEV;
+	if (edev->dma_faulted)
+		ret = -EIO;
+	if (!edev->dma_cpu)
+		ret = -ENODEV;
+
+	spin_unlock_irqrestore(&edev->state_lock, flags);
+
+	if (ret)
+		return ret;
+
+	/*
+	 * op_lock prevents cleanup from freeing this allocation
+	 * while CPU prepares or verifies it.
+	 */
+	tx = edev->dma_cpu;
+	rx = tx + EDU_DMA_BUFFER_SIZE;
+
+	tx_dma = edev->dma_handle;
+	rx_dma = edev->dma_handle + EDU_DMA_BUFFER_SIZE;
+
+	for (i = 0; i < EDU_DMA_BUFFER_SIZE; i++)
+		tx[i] = (u8)(i * 37U + 11U);
+
+	memset(rx, EDU_DMA_RX_GUARD, EDU_DMA_BUFFER_SIZE);
+
+	/*
+	 * Every requested byte begins with a value different
+	 * from its expected result.
+	 */
+	for (i = 0; i < length; i++)
+		rx[i] = tx[i] ^ 0xff;
+
+	ret = edu_dma_transfer_locked(
+		edev,
+		(u64)tx_dma,
+		EDU_DMA_INTERNAL_BASE,
+		length,
+		false);
+	if (ret)
+		return ret;
+
+	/*
+	 * The transfer helper rechecks disconnect before starting
+	 * this second transaction.
+	 */
+	ret = edu_dma_transfer_locked(
+		edev,
+		EDU_DMA_INTERNAL_BASE,
+		(u64)rx_dma,
+		length,
+		true);
+	if (ret)
+		return ret;
+
+	dma_rmb();
+
+	for (i = 0; i < length; i++) {
+		if (rx[i] != tx[i]) {
+			pr_err("edu: %s DMA mismatch at %zu: "
+				"expected=%#x actual=%#x\n",
+				edev->bdf, i,
+				(unsigned int)tx[i],
+				(unsigned int)rx[i]);
+			goto out_fault;
+		}
+	}
+
+	for (i = length; i < EDU_DMA_BUFFER_SIZE; i++) {
+		if (rx[i] != EDU_DMA_RX_GUARD) {
+			pr_err("edu: %s DMA RX tail modified at %zu: %#x\n",
+				edev->bdf, i,
+				(unsigned int)rx[i]);
+			goto out_fault;
+		}
+	}
+
+	return 0;
+
+out_fault:
+	spin_lock_irqsave(&edev->state_lock, flags);
+	edev->dma_faulted = true;
+	spin_unlock_irqrestore(&edev->state_lock, flags);
+
+	return -EIO;
 }
 
 static int edu_run_factorial_locked(struct edu_dev *edev, struct edu_factorial_req *req)
@@ -282,6 +558,8 @@ static int edu_run_factorial_locked(struct edu_dev *edev, struct edu_factorial_r
 	unsigned long timeout;
 	unsigned long flags;
 	int ret;
+
+	lockdep_assert_held(&edev->op_lock);
 
 	spin_lock_irqsave(&edev->state_lock, flags);
 
@@ -364,9 +642,7 @@ static int edu_run_factorial_locked(struct edu_dev *edev, struct edu_factorial_r
 	if (edev->faulted) {
 		pr_warn_ratelimited(
 			"edu: %s factorial failed: fault latched while waiting\n",
-			edev->bdf);    pr_warn_ratelimited(
-				"edu: %s factorial failed: fault latched while waiting\n",
-				edev->bdf);
+			edev->bdf);
 		edu_disable_factorial_irq_locked(edev);
 		edu_ack_all_pending_locked(edev);
 		ret = -EIO;
@@ -465,7 +741,6 @@ static long edu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct edu_file *efile = file->private_data;
 	struct edu_dev *edev;
-	struct edu_factorial_req req;
 	void __user *argp = (void __user *)arg;
 	int ret;
 
@@ -483,12 +758,18 @@ static long edu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return -ENODEV;
 
 	switch (cmd) {
-	case EDU_IOCTL_FACTORIAL:
+	case EDU_IOCTL_FACTORIAL: {
+		struct edu_factorial_req req = {0};
 		if (copy_from_user(&req, argp, sizeof(req)))
 			return -EFAULT;
 
 		if (req.input > EDU_FACTORIAL_MAX_INPUT)
 			return -ERANGE;
+
+
+		if (req.reserved[0] || req.reserved[1] || req.reserved[2]
+			|| req.reserved[3] || req.reserved[4] || req.reserved[5])
+			return -EINVAL;
 
 		ret = mutex_lock_interruptible(&edev->op_lock);
 		if (ret)
@@ -505,6 +786,33 @@ static long edu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 
 		return 0;
+	}
+
+	case EDU_IOCTL_DMA_SELFTEST: {
+		struct edu_dma_selftest_req dma_req = {0};
+
+		if (copy_from_user(&dma_req, argp, sizeof(dma_req)))
+			return -EFAULT;
+
+		if (!dma_req.length ||
+			dma_req.length > EDU_DMA_MAX_LENGTH)
+			return -EINVAL;
+
+		if (dma_req.reserved[0] ||
+			dma_req.reserved[1] ||
+			dma_req.reserved[2])
+			return -EINVAL;
+
+		ret = mutex_lock_interruptible(&edev->op_lock);
+		if (ret)
+			return ret;
+
+		ret = edu_dma_selftest_locked(edev, dma_req.length);
+
+		mutex_unlock(&edev->op_lock);
+
+		return ret;
+	}
 
 	default:
 		return -ENOTTY;
@@ -607,6 +915,9 @@ static void edu_teardown_irqs(struct edu_dev *edev)
 	edev->msi_enabled = false;
 }
 
+static void edu_dma_free(struct edu_dev *edev);
+static void edu_dma_drain_locked(struct edu_dev *edev);
+
 static void edu_disconnect_and_cleanup(struct edu_dev *edev)
 {
 	struct pci_dev *pdev = edev->pdev;
@@ -620,6 +931,7 @@ static void edu_disconnect_and_cleanup(struct edu_dev *edev)
 	spin_lock_irqsave(&edev->state_lock, flags);
 	WRITE_ONCE(edev->disconnected, true);
 	complete_all(&edev->factorial_done);
+	complete_all(&edev->dma_done);
 	spin_unlock_irqrestore(&edev->state_lock, flags);
 
 	wake_up_all(&edev->test_wq);
@@ -637,6 +949,9 @@ static void edu_disconnect_and_cleanup(struct edu_dev *edev)
 	 */
 	mutex_lock(&edev->op_lock);
 
+
+	edu_dma_drain_locked(edev);
+
 	spin_lock_irqsave(&edev->state_lock, flags);
 	if (edev->mmio) {
 		edu_disable_factorial_irq_locked(edev);
@@ -649,6 +964,8 @@ static void edu_disconnect_and_cleanup(struct edu_dev *edev)
 	 * need it before free_irq() can finish.
 	 */
 	edu_teardown_irqs(edev);
+
+	edu_dma_free(edev);
 
 	if (edev->mmio) {
 		pci_iounmap(pdev, edev->mmio);
@@ -678,6 +995,87 @@ static void edu_disconnect_and_cleanup(struct edu_dev *edev)
 	kref_put(&edev->refcount, edu_dev_release);
 }
 
+static int edu_dma_alloc(struct edu_dev *edev)
+{
+	int ret;
+
+	ret = dma_set_mask_and_coherent(&edev->pdev->dev,
+		DMA_BIT_MASK(28));
+	if (ret) {
+		dev_err(&edev->pdev->dev,
+			"28-bit DMA mask unavailable: %d\n", ret);
+		return ret;
+	}
+
+	edev->dma_size = EDU_DMA_ALLOC_SIZE;
+	edev->dma_cpu = dma_alloc_coherent(
+		&edev->pdev->dev,
+		edev->dma_size,
+		&edev->dma_handle,
+		GFP_KERNEL);
+
+	if (!edev->dma_cpu)
+		return -ENOMEM;
+
+	dev_info(&edev->pdev->dev,
+		"coherent DMA allocated: size=%zu dma=%pad\n",
+		edev->dma_size, &edev->dma_handle);
+
+	return 0;
+}
+
+static void edu_dma_free(struct edu_dev *edev)
+{
+	if (!edev->dma_cpu)
+		return;
+	dma_free_coherent(&edev->pdev->dev,
+		edev->dma_size,
+		edev->dma_cpu,
+		edev->dma_handle);
+
+	edev->dma_cpu = NULL;
+	edev->dma_size = 0;
+}
+
+/*
+ * Caller holds op_lock.
+ * No new DMA can start: disconnected is already true.
+ * MMIO remains mapped throughout the drain.
+ *
+ * Intentionally unbounded: EDU has no documented abort command.
+ */
+static void edu_dma_drain_locked(struct edu_dev *edev)
+{
+	unsigned long flags;
+	u64 command;
+	bool reported = false;
+
+	lockdep_assert_held(&edev->op_lock);
+
+	if (!edev->mmio)
+		return;
+
+	for (;;) {
+		spin_lock_irqsave(&edev->state_lock, flags);
+		command = readq(edev->mmio + EDU_REG_DMA_CMD);
+		spin_unlock_irqrestore(&edev->state_lock, flags);
+
+		if (!(command & EDU_DMA_START))
+			break;
+
+		if (!reported) {
+			pr_info("edu: %s waiting for DMA hardware idle\n",
+				edev->bdf);
+			reported = true;
+		}
+
+		usleep_range(1000, 2000);
+	}
+
+	if (reported)
+		pr_info("edu: %s DMA hardware is idle\n", edev->bdf);
+}
+
 static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	int ret;
@@ -701,6 +1099,7 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	mutex_init(&edev->op_lock);
 	spin_lock_init(&edev->state_lock);
 	init_completion(&edev->factorial_done);
+	init_completion(&edev->dma_done);
 	init_waitqueue_head(&edev->test_wq);
 	atomic_set(&edev->irq_count, 0);
 	edev->pci_enabled    = false;
@@ -787,6 +1186,21 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		goto err_cleanup;
 
+	if (readq(edev->mmio + EDU_REG_DMA_CMD) & EDU_DMA_START) {
+		dev_err(&pdev->dev,
+			"DMA engine is busy during probe\n");
+		ret = -EBUSY;
+		goto err_cleanup;
+	}
+
+	ret = edu_dma_alloc(edev);
+	if (ret)
+		goto err_cleanup;
+
+	ret = edu_maybe_fail(pdev, 10);
+	if (ret)
+		goto err_cleanup;
+
 	/*
 	* MMIO is mapped, stale device interrupt state is cleared,
 	* and the factorial engine has been checked for busy.
@@ -858,7 +1272,7 @@ static int __init edu_init(void)
 {
     int ret;
 
-    if (fail_step < 0 || fail_step > 9 ||
+    if (fail_step < 0 || fail_step > 10 ||
         test_hold_ms > 10000 ||
         test_publish_pause_ms > 10000)
         return -EINVAL;
