@@ -14,8 +14,9 @@ static void usage(const char *prog)
    fprintf(stderr,
             "Usage:\n"
             "  %s factorial <0..12>\n"
-            "  %s dma-selftest <1..4096>\n",
-            prog, prog);
+            "  %s dma-selftest <1..4096>\n"
+            "  %s dma-stream <1..4096>\n",
+            prog, prog,prog);
 }
 
 static int parse_value(const char *text, unsigned long *value)
@@ -42,9 +43,9 @@ int main(int argc, char **argv)
     int ret;
     int saved_errno;
 
-    if (argc != 3 ||
-        (strcmp(argv[1], "factorial") &&
-         strcmp(argv[1], "dma-selftest"))) {
+    if (argc != 3 || (strcmp(argv[1], "factorial")
+	&& strcmp(argv[1], "dma-selftest")
+	&& strcmp(argv[1], "dma-stream"))) {
         usage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -85,7 +86,10 @@ int main(int argc, char **argv)
         struct edu_dma_selftest_req req = { 0 };
 
         req.length = (__u32)value;
-        ret = ioctl(fd, EDU_IOCTL_DMA_SELFTEST, &req);
+	unsigned long command = !strcmp(argv[1], "dma-stream")
+	    ? EDU_IOCTL_DMA_STREAM_SELFTEST
+	    : EDU_IOCTL_DMA_SELFTEST;
+        ret = ioctl(fd, command, &req);
         saved_errno = errno;
 
         if (!ret)

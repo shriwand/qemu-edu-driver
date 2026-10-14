@@ -19,6 +19,7 @@ _Static_assert(sizeof(struct edu_dma_selftest_req) == 16,
 enum test_operation {
     TEST_FACTORIAL,
     TEST_DMA,
+    TEST_STREAM,
 };
 
 static void wait_enter(const char *message)
@@ -35,7 +36,12 @@ static void wait_enter(const char *message)
 
 static const char *operation_name(enum test_operation op)
 {
-    return op == TEST_DMA ? "dma" : "factorial";
+    switch (op) {
+	case TEST_FACTORIAL: return "factorial";
+	case TEST_DMA : return "dma";
+	case TEST_STREAM: return "stream";
+    }
+    return "oops";
 }
 
 /*
@@ -53,7 +59,11 @@ static int run_ioctl(int fd, enum test_operation op,
 
         req.length = value;
 
-        ret = ioctl(fd, EDU_IOCTL_DMA_SELFTEST, &req);
+	unsigned long command = op == TEST_STREAM
+	    ? EDU_IOCTL_DMA_STREAM_SELFTEST
+	    : EDU_IOCTL_DMA_SELFTEST;
+
+        ret = ioctl(fd, command, &req);
         if (ret == -1) {
             int saved = errno;
 
@@ -138,7 +148,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage: %s smoke|stale|active|timeout "
-            "[factorial|dma]\n",
+            "[factorial|dma|stream]\n",
             prog);
 }
 
@@ -169,13 +179,15 @@ int main(int argc, char **argv)
     if (argc == 3) {
         if (!strcmp(argv[2], "dma"))
             op = TEST_DMA;
+        if (!strcmp(argv[2], "stream"))
+	    op = TEST_STREAM;
         else if (strcmp(argv[2], "factorial")) {
             usage(argv[0]);
             return 2;
         }
     }
 
-    value = op == TEST_DMA ? 256 : 12;
+    value = op == TEST_FACTORIAL ? 12 : 256;
 
     printf("scenario=%s operation=%s\n",
            argv[1], operation_name(op));

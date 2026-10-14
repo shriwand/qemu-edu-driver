@@ -23,6 +23,9 @@ struct edu_dma_selftest_req {
 #define EDU_IOCTL_DMA_SELFTEST \
     _IOW(EDU_IOCTL_MAGIC, 0x2, struct edu_dma_selftest_req)
 
+#define EDU_IOCTL_DMA_STREAM_SELFTEST \
+    _IOW(EDU_IOCTL_MAGIC, 0x3, struct edu_dma_selftest_req)
+
 #define EDU_FACTORIAL_MAX_INPUT    12
 
 #define EDU_DMA_MAX_LENGTH 4096U

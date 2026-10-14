@@ -156,6 +156,12 @@ module_param(test_dma_hold_ms, uint, 0444);
 MODULE_PARM_DESC(test_dma_hold_ms,
     "Test-only cancellable hold after DMA start, max 10000 ms");
 
+static int test_stream_fail_step;
+module_param(test_stream_fail_step, int, 0444);
+MODULE_PARM_DESC(test_stream_fail_step,
+    "Streaming test failure: "
+    "1=after TX map, 2=before RX map, 3=after RX map");
+
 static struct dentry *edu_debugfs_root;
 
 static int edu_irq_snapshot_open(struct inode *inode,
@@ -552,6 +558,170 @@ out_fault:
 	return -EIO;
 }
 
+static void edu_dma_free(struct edu_dev *edev);
+static void edu_dma_drain_locked(struct edu_dev *edev);
+
+static int edu_dma_stream_selftest_locked(struct edu_dev *edev, size_t length)
+{
+	struct device *dev = &edev->pdev->dev;
+	const size_t map_size = EDU_DMA_BUFFER_SIZE;
+	unsigned long flags;
+	dma_addr_t tx_dma = 0;
+	dma_addr_t rx_dma = 0;
+	bool tx_mapped = false;
+	bool rx_mapped = false;
+	u8 *tx = NULL;
+	u8 *rx = NULL;
+	size_t i;
+	int ret = 0;
+
+	lockdep_assert_held(&edev->op_lock);
+
+	if (!length || length > EDU_DMA_BUFFER_SIZE)
+		return -EINVAL;
+
+	spin_lock_irqsave(&edev->state_lock, flags);
+
+	if (edev->disconnected)
+		ret = -ENODEV;
+	if (edev->dma_faulted)
+		ret = -EIO;
+
+	spin_unlock_irqrestore(&edev->state_lock, flags);
+
+	if (ret)
+		return ret;
+
+	tx = kmalloc(map_size, GFP_KERNEL);
+	rx = kmalloc(map_size, GFP_KERNEL);
+
+	if (!tx || !rx) {
+		ret = -ENOMEM;
+		goto out_cleanup;
+	}
+
+	for (i = 0; i < map_size; i++)
+		tx[i] = (u8)(i * 37U + 11U);
+
+	/*
+	 * Initialize memory before mapping.
+	 * Do not access mapped RX payload until unmap.
+	 */
+	memset(rx, 0, map_size);
+
+	tx_dma = dma_map_single(dev, tx, map_size,
+		DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, tx_dma)) {
+		ret = -ENOMEM;
+		goto out_cleanup;
+	}
+
+	tx_mapped = true;
+
+	if (test_stream_fail_step == 1) {
+	    ret = -EIO;
+	    goto out_cleanup;
+	}
+
+	ret = edu_dma_transfer_locked(
+		edev,
+		(u64)tx_dma,
+		EDU_DMA_INTERNAL_BASE,
+		length,
+		false);
+
+	/*
+	 * Required even after timeout or disconnect.
+	 * Unmap does not stop the DMA engine.
+	 */
+	edu_dma_drain_locked(edev);
+
+	dma_unmap_single(dev, tx_dma, map_size,
+		DMA_TO_DEVICE);
+	tx_mapped = false;
+
+	if (ret)
+		goto out_cleanup;
+
+	if (test_stream_fail_step == 2) {
+	    ret = -ENOMEM;
+	    goto out_cleanup;
+	}
+
+	rx_dma = dma_map_single(dev, rx, map_size,
+		DMA_FROM_DEVICE);
+	if (dma_mapping_error(dev, rx_dma)) {
+		ret = -ENOMEM;
+		goto out_cleanup;
+	}
+
+	rx_mapped = true;
+
+	if (test_stream_fail_step == 3) {
+		ret = -EIO;
+		goto out_cleanup;
+	}
+
+	ret = edu_dma_transfer_locked(
+		edev,
+		EDU_DMA_INTERNAL_BASE,
+		(u64)rx_dma,
+		length,
+		true);
+
+	edu_dma_drain_locked(edev);
+
+	dma_unmap_single(dev, rx_dma, map_size,
+		DMA_FROM_DEVICE);
+	rx_mapped = false;
+
+	if (ret)
+		goto out_cleanup;
+
+	/*
+	 * Both mappings are gone. CPU owns both buffers.
+	 */
+	for (i = 0; i < length; i++) {
+		if (rx[i] != tx[i]) {
+			pr_err("edu: %s streaming mismatch at %zu: "
+				"expected=%#x actual=%#x\n",
+				edev->bdf, i,
+				(unsigned int)tx[i],
+				(unsigned int)rx[i]);
+
+			spin_lock_irqsave(&edev->state_lock, flags);
+			edev->dma_faulted = true;
+			spin_unlock_irqrestore(&edev->state_lock, flags);
+
+			ret = -EIO;
+			goto out_cleanup;
+		}
+	}
+
+	ret = 0;
+
+out_cleanup:
+	/*
+	 * Defensive cleanup for future error-injection branches.
+	 * Keep mapping flags accurate.
+	 */
+	if (tx_mapped || rx_mapped)
+		edu_dma_drain_locked(edev);
+
+	if (rx_mapped)
+		dma_unmap_single(dev, rx_dma, map_size,
+			DMA_FROM_DEVICE);
+
+	if (tx_mapped)
+		dma_unmap_single(dev, tx_dma, map_size,
+			DMA_TO_DEVICE);
+
+	kfree(rx);
+	kfree(tx);
+
+	return ret;
+}
+
 static int edu_run_factorial_locked(struct edu_dev *edev, struct edu_factorial_req *req)
 {
 	u32 status;
@@ -814,6 +984,32 @@ static long edu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return ret;
 	}
 
+	case EDU_IOCTL_DMA_STREAM_SELFTEST: {
+		struct edu_dma_selftest_req stream_req = {0};
+
+		if (copy_from_user(&stream_req, argp, sizeof(stream_req)))
+			return -EFAULT;
+
+		if (!stream_req.length ||
+			stream_req.length > EDU_DMA_MAX_LENGTH)
+			return -EINVAL;
+
+		if (stream_req.reserved[0] ||
+			stream_req.reserved[1] ||
+			stream_req.reserved[2])
+			return -EINVAL;
+		ret = mutex_lock_interruptible(&edev->op_lock);
+		if (ret)
+			return ret;
+
+		ret = edu_dma_stream_selftest_locked(
+			edev, stream_req.length);
+
+		mutex_unlock(&edev->op_lock);
+
+		return ret;
+	}
+
 	default:
 		return -ENOTTY;
 	}
@@ -914,9 +1110,6 @@ static void edu_teardown_irqs(struct edu_dev *edev)
 	edev->irq = -1;
 	edev->msi_enabled = false;
 }
-
-static void edu_dma_free(struct edu_dev *edev);
-static void edu_dma_drain_locked(struct edu_dev *edev);
 
 static void edu_disconnect_and_cleanup(struct edu_dev *edev)
 {
