@@ -1,37 +1,47 @@
-#!/usr/bin/env bash
-# smoke.sh - build + basic sanity without requiring QEMU guest.
-set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+#!/bin/sh
+set -eu
 
-echo "== layout =="
-test -f "$ROOT/kernel/edu_pci.c"
-test -f "$ROOT/kernel/edu_uapi.h"
-test -f "$ROOT/kernel/Makefile"
-test -f "$ROOT/userspace/Makefile"
-echo "layout OK"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
-echo "== userspace build =="
-make -C "$ROOT/userspace"
-"$ROOT/userspace/edu_ctl" --help || true  # exits 0 on --help
-echo "userspace build OK"
+CTL=${CTL:-"$ROOT/userspace/edu_ctl"}
+LIFETIME=${LIFETIME:-"$ROOT/tests/edu_lifetime"}
 
-echo "== kernel build =="
-if [ -d "/lib/modules/$(uname -r)/build" ]; then
-  make -C "$ROOT/kernel"
-  modinfo "$ROOT/kernel/edu_pci.ko" | grep -E "alias|description" || true
-  echo "kernel build OK"
-else
-  echo "SKIP: no /lib/modules/$(uname -r)/build, install kernel headers (kernel-devel / linux-headers)"
-  exit 1
+if [ ! -x "$CTL" ]; then
+    echo "FAIL: executable client missing: $CTL" >&2
+    exit 1
 fi
 
-echo "== device presence (guest only) =="
-if [ -e /dev/edu0 ]; then
-  "$ROOT/userspace/edu_ctl" ident
-  "$ROOT/userspace/edu_ctl" fact 5
-  "$ROOT/userspace/edu_ctl" dma --len 256
-else
-  echo "SKIP device test: /dev/edu0 not present (load module in QEMU guest with -device edu)"
+if [ ! -x "$LIFETIME" ]; then
+    echo "FAIL: executable test client missing: $LIFETIME" >&2
+    exit 1
 fi
 
-echo "SMOKE OK"
+if [ ! -e /dev/edu0 ]; then
+    echo "FAIL: /dev/edu0 missing; load and bind the driver first" >&2
+    exit 1
+fi
+
+echo "== factorial =="
+
+"$CTL" factorial 0
+"$CTL" factorial 5
+"$CTL" factorial 12
+
+echo "== coherent DMA =="
+
+for length in 1 63 64 65 255 256 257 4096; do
+    "$CTL" dma-selftest "$length"
+done
+
+echo "== streaming DMA =="
+
+for length in 1 63 64 65 255 256 257 4096; do
+    "$CTL" dma-stream "$length"
+done
+
+echo "== repeated operations =="
+
+"$LIFETIME" smoke dma
+"$LIFETIME" smoke stream
+
+echo "PASS: normal smoke commands completed successfully"

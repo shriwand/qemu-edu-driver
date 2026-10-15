@@ -86,7 +86,7 @@ int main(int argc, char **argv)
         struct edu_dma_selftest_req req = { 0 };
 
         req.length = (__u32)value;
-	unsigned long command = !strcmp(argv[1], "dma-stream")
+	unsigned long command = !strcmp(argv[1], "dma-selftest")
 	    ? EDU_IOCTL_DMA_SELFTEST
 	    : EDU_IOCTL_DMA_STREAM_SELFTEST;
         ret = ioctl(fd, command, &req);

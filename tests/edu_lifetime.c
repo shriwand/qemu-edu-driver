@@ -59,7 +59,7 @@ static int run_ioctl(int fd, enum test_operation op,
 
         req.length = value;
 
-	unsigned long command = op == TEST_STREAM
+	unsigned long command = op == TEST_DMA
 	    ? EDU_IOCTL_DMA_SELFTEST
 	    : EDU_IOCTL_DMA_STREAM_SELFTEST;
 

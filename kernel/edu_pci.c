@@ -19,7 +19,6 @@
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/spinlock.h>
-#include <linux/string.h>
 #include <linux/uaccess.h>
 
 #include "uapi/edu_uapi.h"
@@ -63,8 +62,8 @@
 #define EDU_DMA_TIMEOUT_MS    1000U
 #define EDU_DMA_RX_GUARD      0xa5
 
-#define EDU_BAR_MIN_SIZE \
-    (EDU_REG_DMA_CMD + sizeof(u64))
+#define EDU_BAR_MIN_SIZE			\
+	(EDU_REG_DMA_CMD + sizeof(u64))
 
 struct edu_dev {
 	struct kref refcount;
@@ -107,12 +106,12 @@ struct edu_dev {
 };
 
 struct edu_file {
-    struct edu_dev *edev;
+	struct edu_dev *edev;
 };
 
 struct edu_irq_snapshot {
-    char text[32];
-    size_t len;
+	char text[32];
+	size_t len;
 };
 
 
@@ -125,42 +124,39 @@ MODULE_DEVICE_TABLE(pci, edu_ids);
 static int fail_step;
 module_param(fail_step, int, 0444);
 MODULE_PARM_DESC(fail_step,
-	"Probe failure: "
-	"1=enable, 2=BAR, 3=map, 4=prepare, "
-	"5=IRQ, 6=debugfs, 7=misc publication, "
-	"8=IRQ vector allocation, 9=before request_irq, "
+	"Probe failure: 1=enable, 2=BAR, 3=map, 4=prepare, "
+	"5=IRQ, 6=debugfs, 7=misc publication, 8=IRQ vector allocation, 9=before request_irq, "
 	"10=after coherent DMA allocation");
 
 static unsigned int test_hold_ms;
 module_param(test_hold_ms, uint, 0444);
 MODULE_PARM_DESC(test_hold_ms,
-    "Test-only cancellable hold after factorial start, max 10000 ms");
+	"Test-only cancellable hold after factorial start, max 10000 ms");
 
 static bool test_force_timeout;
 module_param(test_force_timeout, bool, 0444);
 MODULE_PARM_DESC(test_force_timeout,
-    "Test-only suppress factorial completion notification");
+	"Test-only suppress factorial completion notification");
 
 static unsigned int test_publish_pause_ms;
 module_param(test_publish_pause_ms, uint, 0444);
 MODULE_PARM_DESC(test_publish_pause_ms,
-    "Test-only pause after misc publication, max 10000 ms");
+	"Test-only pause after misc publication, max 10000 ms");
 
 static bool test_force_dma_timeout;
 module_param(test_force_dma_timeout, bool, 0444);
 MODULE_PARM_DESC(test_force_dma_timeout,
-    "Test-only: ACK DMA IRQ but suppress DMA completion");
+	"Test-only: ACK DMA IRQ but suppress DMA completion");
 
 static unsigned int test_dma_hold_ms;
 module_param(test_dma_hold_ms, uint, 0444);
 MODULE_PARM_DESC(test_dma_hold_ms,
-    "Test-only cancellable hold after DMA start, max 10000 ms");
+	"Test-only cancellable hold after DMA start, max 10000 ms");
 
 static int test_stream_fail_step;
 module_param(test_stream_fail_step, int, 0444);
 MODULE_PARM_DESC(test_stream_fail_step,
-    "Streaming test failure: "
-    "1=after TX map, 2=before RX map, 3=after RX map");
+	"Streaming test failure: 1=after TX map, 2=before RX map, 3=after RX map");
 
 static struct dentry *edu_debugfs_root;
 
@@ -171,7 +167,7 @@ static int edu_irq_snapshot_open(struct inode *inode,
 	struct edu_irq_snapshot *snapshot;
 	int count;
 
-	snapshot = kzalloc(sizeof(*snapshot), GFP_KERNEL);
+	snapshot = kzalloc_obj(*snapshot, GFP_KERNEL);
 	if (!snapshot)
 		return -ENOMEM;
 
@@ -327,7 +323,7 @@ static irqreturn_t edu_irq_handler(int irq, void *data)
 	if (notify_factorial)
 		complete(&edev->factorial_done);
 
-	if(notify_dma)
+	if (notify_dma)
 		complete(&edev->dma_done);
 
 	spin_unlock_irqrestore(&edev->state_lock, flags);
@@ -528,8 +524,7 @@ static int edu_dma_selftest_locked(struct edu_dev *edev, size_t length)
 
 	for (i = 0; i < length; i++) {
 		if (rx[i] != tx[i]) {
-			pr_err("edu: %s DMA mismatch at %zu: "
-				"expected=%#x actual=%#x\n",
+			pr_err("edu: %s DMA mismatch at %zu: expected=%#x actual=%#x\n",
 				edev->bdf, i,
 				(unsigned int)tx[i],
 				(unsigned int)rx[i]);
@@ -619,8 +614,8 @@ static int edu_dma_stream_selftest_locked(struct edu_dev *edev, size_t length)
 	tx_mapped = true;
 
 	if (test_stream_fail_step == 1) {
-	    ret = -EIO;
-	    goto out_cleanup;
+		ret = -EIO;
+		goto out_cleanup;
 	}
 
 	ret = edu_dma_transfer_locked(
@@ -644,8 +639,8 @@ static int edu_dma_stream_selftest_locked(struct edu_dev *edev, size_t length)
 		goto out_cleanup;
 
 	if (test_stream_fail_step == 2) {
-	    ret = -ENOMEM;
-	    goto out_cleanup;
+		ret = -ENOMEM;
+		goto out_cleanup;
 	}
 
 	rx_dma = dma_map_single(dev, rx, map_size,
@@ -683,8 +678,7 @@ static int edu_dma_stream_selftest_locked(struct edu_dev *edev, size_t length)
 	 */
 	for (i = 0; i < length; i++) {
 		if (rx[i] != tx[i]) {
-			pr_err("edu: %s streaming mismatch at %zu: "
-				"expected=%#x actual=%#x\n",
+			pr_err("edu: %s streaming mismatch at %zu: expected=%#x actual=%#x\n",
 				edev->bdf, i,
 				(unsigned int)tx[i],
 				(unsigned int)rx[i]);
@@ -853,7 +847,7 @@ static int edu_open(struct inode *unused_inode, struct file *file)
 	unsigned long flags;
 	int ret = 0;
 
-	efile = kzalloc(sizeof(*efile), GFP_KERNEL);
+	efile = kzalloc_obj(*efile, GFP_KERNEL);
 	if (!efile)
 		return -ENOMEM;
 
@@ -879,6 +873,7 @@ static int edu_open(struct inode *unused_inode, struct file *file)
 static void edu_dev_release(struct kref *kref)
 {
 	struct edu_dev *edev = container_of(kref, struct edu_dev, refcount);
+
 	pr_debug("edu: object released for %s\n", edev->bdf);
 	kfree(edev);
 }
@@ -930,6 +925,7 @@ static long edu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case EDU_IOCTL_FACTORIAL: {
 		struct edu_factorial_req req = {0};
+
 		if (copy_from_user(&req, argp, sizeof(req)))
 			return -EFAULT;
 
@@ -1044,7 +1040,7 @@ static int edu_setup_irqs(struct edu_dev *edev)
 	ret = pci_alloc_irq_vectors(pdev, 1, 1,
 		PCI_IRQ_MSI | PCI_IRQ_INTX);
 	if (ret < 0) {
-		dev_err(&pdev->dev,"failed to allocate irq vector: %d\n", ret);
+		dev_err(&pdev->dev, "failed to allocate irq vector: %d\n", ret);
 		return ret;
 	}
 
@@ -1282,7 +1278,7 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	dev_info(&pdev->dev, "probing EDU at %s\n", pci_name(pdev));
 
-	edev = kzalloc(sizeof(*edev), GFP_KERNEL);
+	edev = kzalloc_obj(*edev, GFP_KERNEL);
 	if (!edev)
 		return -ENOMEM;
 
@@ -1360,9 +1356,9 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	dev_info(&pdev->dev, "EDU identification register: %#010x\n", ident);
 
 	/*
-	* No IRQ handler or userspace entry exists yet.
-	* Disable and clear stale interrupt state before request_irq.
-	*/
+	 * No IRQ handler or userspace entry exists yet.
+	 * Disable and clear stale interrupt state before request_irq.
+	 */
 	spin_lock_irqsave(&edev->state_lock, flags);
 	edu_disable_factorial_irq_locked(edev);
 	edu_ack_all_pending_locked(edev);
@@ -1396,11 +1392,11 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_cleanup;
 
 	/*
-	* MMIO is mapped, stale device interrupt state is cleared,
-	* and the factorial engine has been checked for busy.
-	*
-	* MSI delivery is a device-initiated memory write.
-	*/
+	 * MMIO is mapped, stale device interrupt state is cleared,
+	 * and the factorial engine has been checked for busy.
+	 *
+	 * MSI delivery is a device-initiated memory write.
+	 */
 	pci_set_master(pdev);
 
 	ret = edu_setup_irqs(edev);
@@ -1439,7 +1435,7 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_cleanup;
 
 	dev_info(&pdev->dev, "userspace device /dev/%s ready\n",
-		 edev->miscdev.name);
+		edev->miscdev.name);
 
 	return 0;
 
@@ -1451,6 +1447,7 @@ err_cleanup:
 static void edu_remove(struct pci_dev *pdev)
 {
 	struct edu_dev *edev = pci_get_drvdata(pdev);
+
 	edu_disconnect_and_cleanup(edev);
 	dev_info(&pdev->dev, "EDU remove completed\n");
 }
@@ -1464,35 +1461,35 @@ static struct pci_driver edu_driver = {
 
 static int __init edu_init(void)
 {
-    int ret;
+	int ret;
 
-    if (fail_step < 0 || fail_step > 10 ||
-	test_hold_ms > 10000 ||
-	test_publish_pause_ms > 10000 ||
-	test_dma_hold_ms > 10000 ||
-	test_stream_fail_step < 0 ||
-	test_stream_fail_step > 3)
-	    return -EINVAL;
+	if (fail_step < 0 || fail_step > 10 ||
+		test_hold_ms > 10000 ||
+		test_publish_pause_ms > 10000 ||
+		test_dma_hold_ms > 10000 ||
+		test_stream_fail_step < 0 ||
+		test_stream_fail_step > 3)
+		return -EINVAL;
 
-    edu_debugfs_root = debugfs_create_dir(EDU_NAME, NULL);
-    if (IS_ERR_OR_NULL(edu_debugfs_root))
-        edu_debugfs_root = NULL;
+	edu_debugfs_root = debugfs_create_dir(EDU_NAME, NULL);
+	if (IS_ERR_OR_NULL(edu_debugfs_root))
+		edu_debugfs_root = NULL;
 
-    ret = pci_register_driver(&edu_driver);
-    if (ret) {
-        debugfs_remove(edu_debugfs_root);
-        edu_debugfs_root = NULL;
-        return ret;
-    }
+	ret = pci_register_driver(&edu_driver);
+	if (ret) {
+		debugfs_remove(edu_debugfs_root);
+		edu_debugfs_root = NULL;
+		return ret;
+	}
 
-    return 0;
+	return 0;
 }
 
 static void __exit edu_exit(void)
 {
-    pci_unregister_driver(&edu_driver);
-    debugfs_remove(edu_debugfs_root);
-    edu_debugfs_root = NULL;
+	pci_unregister_driver(&edu_driver);
+	debugfs_remove(edu_debugfs_root);
+	edu_debugfs_root = NULL;
 }
 
 module_init(edu_init);
